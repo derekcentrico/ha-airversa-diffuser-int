@@ -792,3 +792,38 @@ async def test_disconnect_during_drain_keeps_confirmed_result(
     diffuser, _ = make(hass, device)
     await diffuser.async_turn_on()
     assert diffuser.is_on is True
+
+
+async def test_mode_confirmed_by_read_back(
+    hass: HomeAssistant, fast_timeouts
+) -> None:
+    """11.1.2 stays silent after 0x3b; the clock sync dump shows the result."""
+    applied: list[bytes] = []
+
+    def device(frame: bytes) -> list[bytes]:
+        if frame[0] == p.CMD_MODE:
+            applied.append(bytes([p.PUSH_MODE]) + frame[1:])
+            return []
+        if frame[0] == p.CMD_TIME and applied:
+            return [b"\xa1", applied[-1]]
+        return []
+
+    diffuser, client = make(hass, device)
+    diffuser._on_notify(None, bytearray(MODE_PRESET_2))
+    await diffuser.async_set_grade(1)
+    assert diffuser.snapshot.mode.grade == 1
+    assert sum(w[0] == p.CMD_MODE for w in client.writes) == 1
+
+
+async def test_mode_read_back_mismatch_raises(
+    hass: HomeAssistant, fast_timeouts
+) -> None:
+    def device(frame: bytes) -> list[bytes]:
+        if frame[0] == p.CMD_TIME:
+            return [MODE_PRESET_2]
+        return []
+
+    diffuser, _ = make(hass, device)
+    diffuser._on_notify(None, bytearray(MODE_PRESET_2))
+    with pytest.raises(DiffuserError, match="mode 0 intensity 2"):
+        await diffuser.async_set_grade(1)

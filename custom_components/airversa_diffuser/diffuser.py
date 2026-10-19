@@ -113,6 +113,7 @@ class AirversaDiffuser:
         self._pending: _Pending | None = None
         self._login_future: asyncio.Future[bytes] | None = None
         self._sync_done = asyncio.Event()
+        self._mode_seen = asyncio.Event()
         self._background: set[asyncio.Task] = set()
 
         self._connected = False
@@ -382,16 +383,52 @@ class AirversaDiffuser:
                 and (state.mode != p.Mode.PRESET or state.grade == grade)
             )
 
+        # Firmware 11.1.2 neither acks 0x3b nor pushes 0x5b afterwards, so
+        # one write is enough; a resend would only repeat the change.
         ack = await self._async_command(
-            frame, confirm_pushes=frozenset({p.PUSH_MODE}), matches=applied
+            frame,
+            confirm_pushes=frozenset({p.PUSH_MODE}),
+            matches=applied,
+            attempts=1,
         )
         if ack is None:
-            raise DiffuserError("device did not confirm the mode change")
+            ack = await self._async_read_back_mode(applied)
         if ack[0] != p.PUSH_MODE and self.snapshot.mode is not None:
             # ACK only: reflect the request until the device pushes state.
             self.snapshot.mode.mode = int(mode_value)
             self.snapshot.mode.grade = grade
             self._notify_listeners()
+
+    async def _async_read_back_mode(
+        self, applied: Callable[[bytes], bool]
+    ) -> bytes:
+        """Ask for a state dump and check the mode the device reports."""
+        async with self._cmd_lock:
+            client = self._client
+            if client is None or not client.is_connected:
+                raise DiffuserError("not connected")
+            self._mode_seen.clear()
+            try:
+                await self._async_write(
+                    client, p.build_time_sync(dt_util.now())
+                )
+            except BleakError as err:
+                raise DiffuserError(f"write failed: {err}") from err
+            try:
+                await asyncio.wait_for(self._mode_seen.wait(), SYNC_TIMEOUT)
+            except TimeoutError as err:
+                raise DiffuserError(
+                    "device did not report its mode after the change"
+                ) from err
+        state = self.snapshot.mode
+        if state is None or not applied(b""):
+            raise DiffuserError(
+                "device reports mode "
+                f"{state.mode if state else '?'} "
+                f"intensity {state.grade if state else '?'}; "
+                "change not applied"
+            )
+        return bytes([p.PUSH_MODE])
 
     async def async_set_schedule(self, schedule: p.Schedule) -> None:
         """Write one native schedule slot."""
@@ -569,6 +606,9 @@ class AirversaDiffuser:
             self._power_source = SOURCE_DEVICE
             self._muted = control.muted
             self._muted_source = SOURCE_DEVICE
+
+        if handled == p.PUSH_MODE:
+            self._mode_seen.set()
 
         # ANP finishes its dump with the mode frame, others with control.
         if handled == p.PUSH_MODE or (
