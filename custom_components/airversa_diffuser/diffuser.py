@@ -238,7 +238,7 @@ class AirversaDiffuser:
         if client is not None:
             try:
                 await client.disconnect()
-            except BleakError as err:
+            except (BleakError, TimeoutError, EOFError) as err:
                 _LOGGER.debug(
                     "%s: error during disconnect: %s", self.address, err
                 )
@@ -498,7 +498,9 @@ class AirversaDiffuser:
         try:
             await asyncio.wait_for(sink, timeout)
             _LOGGER.debug("%s: discarded late ACK", self.address)
-        except TimeoutError:
+        except (TimeoutError, DiffuserError):
+            # A disconnect here clears the straggler anyway and must not
+            # fail a command that was already confirmed.
             pass
         finally:
             self._pending = None

@@ -776,3 +776,19 @@ async def test_schedule_push_for_other_slot_does_not_confirm(
     )
     with pytest.raises(DiffuserError):
         await diffuser.async_set_schedule(schedule)
+
+
+async def test_disconnect_during_drain_keeps_confirmed_result(
+    hass: HomeAssistant, fast_timeouts
+) -> None:
+    def device(frame: bytes) -> list[bytes]:
+        if frame[0] == p.CMD_POWER:
+            asyncio.get_running_loop().call_later(
+                0.01, diffuser._fail_pending, "disconnected"
+            )
+            return [bytes.fromhex("4d01")]
+        return []
+
+    diffuser, _ = make(hass, device)
+    await diffuser.async_turn_on()
+    assert diffuser.is_on is True
