@@ -616,3 +616,40 @@ async def test_invalid_pin_setting_is_config_error(
     ):
         await diffuser._async_connect_and_maintain(object())
     assert client.writes == []
+
+
+async def test_push_during_command_wins(hass: HomeAssistant) -> None:
+    """A control push that lands before the ACK is the device's real state."""
+
+    def device(frame: bytes) -> list[bytes]:
+        if frame[0] == p.CMD_POWER:
+            return [bytes.fromhex("4d40"), b"\xad"]
+        return []
+
+    diffuser, _ = make(hass, device)
+    await diffuser.async_turn_on()
+    assert diffuser.is_on is False
+    assert diffuser.muted is True
+    assert diffuser.power_reported
+
+
+async def test_unexpected_long_ack_uses_request(hass: HomeAssistant) -> None:
+    diffuser, _ = make(hass, lambda f: [bytes.fromhex("ad0000")])
+    await diffuser.async_turn_on()
+    assert diffuser.is_on is True
+
+
+async def test_reconnect_clears_session_snapshot(
+    hass: HomeAssistant, fast_timeouts
+) -> None:
+    diffuser = AirversaDiffuser(hass, "24:42:e3:60:f8:7e", 2.0, model="ANP")
+    diffuser.snapshot.login = p.parse_login_reply(ANP_LOGIN)
+    diffuser.snapshot.mode = p.parse_mode(MODE_PRESET_2)
+    client = FakeClient(diffuser, silent)
+    diffuser._stop.set()
+    with patch.object(
+        diffuser_mod, "establish_connection", return_value=client
+    ):
+        await diffuser._async_connect_and_maintain(object())
+    assert diffuser.snapshot.login is None
+    assert diffuser.snapshot.mode is None

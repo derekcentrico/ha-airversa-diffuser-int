@@ -109,6 +109,8 @@ class AirversaDiffuser:
         # Power and mute share one byte; this lock covers reading the
         # current pair and writing the new one.
         self._power_lock = asyncio.Lock()
+        # Every GATT write goes through one queue, like the vendor app.
+        self._write_lock = asyncio.Lock()
         self._pending: _Pending | None = None
         self._login_future: asyncio.Future[bytes] | None = None
         self._sync_done = asyncio.Event()
@@ -246,6 +248,14 @@ class AirversaDiffuser:
         self._pending = None
         if pending is not None and not pending.future.done():
             pending.future.set_exception(DiffuserError(reason))
+            # Mark retrieved so a waiter-less drain sink does not warn.
+            pending.future.exception()
+
+    async def _async_write(
+        self, client: BleakClientWithServiceCache, frame: bytes
+    ) -> None:
+        async with self._write_lock:
+            await client.write_gatt_char(p.CHAR_UUID, frame, response=False)
 
     # -------------------------------------------------------------- commands
     async def async_turn_on(self) -> None:
@@ -287,6 +297,7 @@ class AirversaDiffuser:
 
     async def _async_send_power(self, on: bool, muted: bool) -> None:
         frame = p.build_power(on, muted)
+        control_before = self.snapshot.control
         ack = await self._async_command(
             frame, confirm_pushes=frozenset({p.PUSH_CONTROL})
         )
@@ -295,10 +306,13 @@ class AirversaDiffuser:
                 f"no acknowledgement for {'ON' if on else 'OFF'}; "
                 "state left unchanged"
             )
-        if ack[0] == p.PUSH_CONTROL:
-            # The device answered with its real state; already applied.
+        if ack[0] == p.PUSH_CONTROL or self.snapshot.control is not (
+            control_before
+        ):
+            # The device reported its real state while the command was in
+            # flight; that already applied and wins over the request.
             return
-        if len(ack) >= 2:
+        if len(ack) == 2 and ack[1] & 0x12 == 0x12:
             # Older firmware echoes the value it applied; trust that over
             # what was requested.
             on = bool(ack[1] & 0x01)
@@ -420,9 +434,7 @@ class AirversaDiffuser:
                 self._pending = _Pending(frame[0], confirm_pushes, future)
                 try:
                     _LOGGER.debug("%s: tx %s", self.address, frame.hex())
-                    await client.write_gatt_char(
-                        p.CHAR_UUID, frame, response=False
-                    )
+                    await self._async_write(client, frame)
                     return await asyncio.wait_for(future, timeout)
                 except TimeoutError:
                     _LOGGER.debug(
@@ -573,7 +585,7 @@ class AirversaDiffuser:
         if client is None or not client.is_connected:
             return
         try:
-            await client.write_gatt_char(p.CHAR_UUID, frame, response=False)
+            await self._async_write(client, frame)
         except BleakError as err:
             _LOGGER.debug("%s: reply write failed: %s", self.address, err)
 
@@ -655,7 +667,7 @@ class AirversaDiffuser:
             raise PinRejectedError(f"invalid PIN setting: {err}") from err
         self._login_future = loop.create_future()
         try:
-            await client.write_gatt_char(p.CHAR_UUID, frame, response=False)
+            await self._async_write(client, frame)
             raw = await asyncio.wait_for(self._login_future, LOGIN_TIMEOUT)
         except TimeoutError:
             _LOGGER.debug("%s: no login reply; continuing", self.address)
@@ -684,9 +696,7 @@ class AirversaDiffuser:
         if (login.protocol_version or 0) < 3.0:
             return
         self._sync_done.clear()
-        await client.write_gatt_char(
-            p.CHAR_UUID, p.build_time_sync(dt_util.now()), response=False
-        )
+        await self._async_write(client, p.build_time_sync(dt_util.now()))
         try:
             await asyncio.wait_for(self._sync_done.wait(), SYNC_TIMEOUT)
         except TimeoutError:
@@ -711,9 +721,7 @@ class AirversaDiffuser:
             await self._async_login(client)
             await self._async_sync(client)
             await asyncio.sleep(KEEPALIVE_SETTLE)
-            await client.write_gatt_char(
-                p.CHAR_UUID, p.KEEPALIVE, response=False
-            )
+            await self._async_write(client, p.KEEPALIVE)
 
             self._connected = True
             self.last_error = None
@@ -725,9 +733,7 @@ class AirversaDiffuser:
             while client.is_connected and not self._stop.is_set():
                 await asyncio.sleep(self.keepalive)
                 try:
-                    await client.write_gatt_char(
-                        p.CHAR_UUID, p.KEEPALIVE, response=False
-                    )
+                    await self._async_write(client, p.KEEPALIVE)
                 except BleakError as err:
                     _LOGGER.debug(
                         "%s: keepalive failed (%s); reconnecting",
@@ -743,8 +749,11 @@ class AirversaDiffuser:
 
     def _mark_previous_session(self) -> None:
         """Demote last session's device state until the device re-reports it."""
+        self.snapshot.login = None
         self.snapshot.control = None
         self.snapshot.status = None
+        self.snapshot.mode = None
+        self.snapshot.schedules.clear()
         if self._power_source is not None:
             self._power_source = SOURCE_PREVIOUS
         if self._muted_source is not None:

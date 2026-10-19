@@ -142,8 +142,8 @@ def ack_head(command: int) -> int:
 # --------------------------------------------------------------- encoders
 def build_login(pin: str = DEFAULT_PIN) -> bytes:
     """Build the login frame (PIN followed by the fixed pairing code)."""
-    if not pin.isascii() or not pin:
-        raise ProtocolError("PIN must be non-empty ASCII")
+    if not pin or len(pin) > 12 or not pin.isascii() or not pin.isprintable():
+        raise ProtocolError("PIN must be 1-12 printable ASCII characters")
     return bytes([CMD_LOGIN]) + (pin + PAIR_CODE).encode("ascii")
 
 
