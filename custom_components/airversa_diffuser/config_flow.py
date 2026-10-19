@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import voluptuous as vol
@@ -20,9 +21,20 @@ from homeassistant.const import CONF_ADDRESS, CONF_NAME
 from homeassistant.core import callback
 from homeassistant.helpers.device_registry import format_mac
 
-from .const import CONF_KEEPALIVE, DEFAULT_KEEPALIVE, DOMAIN
+from .const import (
+    CONF_KEEPALIVE,
+    CONF_MODEL,
+    CONF_PIN,
+    CONF_SYNC_STATE,
+    DEFAULT_KEEPALIVE,
+    DEFAULT_SYNC_STATE,
+    DOMAIN,
+)
+from .protocol import DEFAULT_PIN, model_from_name
 
 DEFAULT_NAME = "Airversa Diffuser"
+
+_MAC_RE = re.compile(r"^[0-9A-F]{2}(:[0-9A-F]{2}){5}$")
 
 
 def _title(name: str | None, address: str) -> str:
@@ -63,7 +75,9 @@ class AirversaConfigFlow(ConfigFlow, domain=DOMAIN):
         assert self._discovery is not None
         if user_input is not None:
             return self._async_create(
-                self._discovery.address, self._discovery.name
+                self._discovery.address,
+                self._discovery.name,
+                model_from_name(self._discovery.name),
             )
 
         self._set_confirm_only()
@@ -82,12 +96,17 @@ class AirversaConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            address = user_input[CONF_ADDRESS].strip().upper()
-            await self.async_set_unique_id(
-                format_mac(address), raise_on_progress=False
+            address = (
+                user_input[CONF_ADDRESS].strip().upper().replace("-", ":")
             )
-            self._abort_if_unique_id_configured()
-            return self._async_create(address, user_input.get(CONF_NAME))
+            if not _MAC_RE.match(address):
+                errors[CONF_ADDRESS] = "invalid_address"
+            else:
+                await self.async_set_unique_id(
+                    format_mac(address), raise_on_progress=False
+                )
+                self._abort_if_unique_id_configured()
+                return self._async_create(address, user_input.get(CONF_NAME))
 
         # Offer any currently-discovered, not-yet-configured devices as hints.
         current_addrs = {
@@ -121,12 +140,12 @@ class AirversaConfigFlow(ConfigFlow, domain=DOMAIN):
     # --------------------------------------------------------------- helper
     @callback
     def _async_create(
-        self, address: str, name: str | None
+        self, address: str, name: str | None, model: str | None = None
     ) -> ConfigFlowResult:
-        return self.async_create_entry(
-            title=_title(name, address),
-            data={CONF_ADDRESS: address.upper()},
-        )
+        data: dict[str, Any] = {CONF_ADDRESS: address.upper()}
+        if model:
+            data[CONF_MODEL] = model
+        return self.async_create_entry(title=_title(name, address), data=data)
 
     @staticmethod
     @callback
@@ -143,18 +162,24 @@ class AirversaOptionsFlow(OptionsFlow):
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Manage the keepalive option."""
+        """Manage keepalive, PIN and state sync options."""
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
-        current = self.config_entry.options.get(
-            CONF_KEEPALIVE, DEFAULT_KEEPALIVE
-        )
+        options = self.config_entry.options
         schema = vol.Schema(
             {
                 vol.Optional(
-                    CONF_KEEPALIVE, default=current
+                    CONF_KEEPALIVE,
+                    default=options.get(CONF_KEEPALIVE, DEFAULT_KEEPALIVE),
                 ): vol.All(vol.Coerce(float), vol.Range(min=0.5, max=30.0)),
+                vol.Optional(
+                    CONF_PIN, default=options.get(CONF_PIN, DEFAULT_PIN)
+                ): vol.All(str, vol.Match(r"^[0-9]{4,8}$")),
+                vol.Optional(
+                    CONF_SYNC_STATE,
+                    default=options.get(CONF_SYNC_STATE, DEFAULT_SYNC_STATE),
+                ): bool,
             }
         )
         return self.async_show_form(step_id="init", data_schema=schema)
