@@ -122,7 +122,8 @@ async def test_missing_ack_leaves_state_and_retries(
     hass: HomeAssistant, fast_timeouts
 ) -> None:
     diffuser, client = make(hass, silent)
-    await diffuser.async_turn_on()
+    with pytest.raises(DiffuserError, match="no acknowledgement"):
+        await diffuser.async_turn_on()
     assert diffuser.is_on is None
     assert client.writes == [bytes.fromhex("2d13")] * 3
 
@@ -147,7 +148,8 @@ async def test_unrelated_ack_does_not_confirm(
     hass: HomeAssistant, fast_timeouts
 ) -> None:
     diffuser, _ = make(hass, lambda f: [b"\xbb"])
-    await diffuser.async_turn_on()
+    with pytest.raises(DiffuserError):
+        await diffuser.async_turn_on()
     assert diffuser.is_on is None
 
 
@@ -446,3 +448,125 @@ async def test_model_listener(hass: HomeAssistant) -> None:
     diffuser._on_notify(None, bytearray.fromhex("45414e50"))
     assert seen == ["ANP"]
     assert diffuser.model == "ANP"
+
+
+async def test_late_ack_cannot_confirm_next_command(
+    hass: HomeAssistant, fast_timeouts
+) -> None:
+    """A straggler ACK from a failed ON must not confirm the following OFF."""
+    writes = 0
+
+    def device(frame: bytes) -> list[bytes]:
+        nonlocal writes
+        writes += 1
+        if writes == 3:
+            # Last retry's ACK shows up after its timeout, inside the drain.
+            asyncio.get_running_loop().call_later(
+                0.07, diffuser._on_notify, None, bytearray(b"\xad")
+            )
+        return []
+
+    diffuser, _ = make(hass, device)
+    with pytest.raises(DiffuserError):
+        await diffuser.async_turn_on()
+    with pytest.raises(DiffuserError):
+        await diffuser.async_turn_off()
+    assert diffuser.is_on is None
+
+
+async def test_stale_queued_power_dropped(
+    hass: HomeAssistant, fast_timeouts
+) -> None:
+    diffuser = AirversaDiffuser(hass, "24:42:e3:60:f8:7e", 2.0, model=None)
+    await diffuser.async_turn_on()
+    diffuser._queued_at -= diffuser_mod.QUEUE_TTL + 1
+    diffuser._desired = None
+    client = FakeClient(diffuser, single_byte_acks)
+    diffuser._stop.set()
+    with patch.object(
+        diffuser_mod, "establish_connection", return_value=client
+    ):
+        await diffuser._async_connect_and_maintain(object())
+    assert not any(w[0] == p.CMD_POWER for w in client.writes)
+
+
+async def test_reconnect_demotes_previous_device_state(
+    hass: HomeAssistant, fast_timeouts
+) -> None:
+    diffuser = AirversaDiffuser(hass, "24:42:e3:60:f8:7e", 2.0, model="ANP")
+    diffuser._power = True
+    diffuser._power_source = diffuser_mod.SOURCE_DEVICE
+    diffuser._muted_source = diffuser_mod.SOURCE_DEVICE
+    client = FakeClient(diffuser, silent)
+    diffuser._stop.set()
+    with patch.object(
+        diffuser_mod, "establish_connection", return_value=client
+    ):
+        await diffuser._async_connect_and_maintain(object())
+    assert diffuser.is_on is True
+    assert diffuser.power_source == diffuser_mod.SOURCE_PREVIOUS
+    assert not diffuser.power_reported
+    assert not diffuser.muted_reported
+
+
+async def test_unsolicited_legacy_ack_ignored_after_report(
+    hass: HomeAssistant,
+) -> None:
+    diffuser, _ = make(hass, silent)
+    diffuser._on_notify(None, bytearray.fromhex("4d00"))
+    diffuser._on_notify(None, bytearray.fromhex("ad13"))
+    assert diffuser.is_on is False
+    assert diffuser.power_reported
+
+
+async def test_pin_rejection_backs_off(hass: HomeAssistant) -> None:
+    diffuser = AirversaDiffuser(hass, "24:42:e3:60:f8:7e", 2.0)
+    delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+        diffuser._stop.set()
+
+    with (
+        patch.object(
+            diffuser_mod.bluetooth,
+            "async_ble_device_from_address",
+            return_value=object(),
+        ),
+        patch.object(
+            diffuser,
+            "_async_connect_and_maintain",
+            side_effect=diffuser_mod.PinRejectedError(
+                "device rejected the PIN"
+            ),
+        ),
+        patch.object(diffuser_mod.asyncio, "sleep", fake_sleep),
+    ):
+        await diffuser._run()
+    assert delays == [diffuser_mod.PIN_REJECTED_DELAY]
+    assert diffuser.last_error == "device rejected the PIN"
+
+
+async def test_transient_error_uses_short_delay(hass: HomeAssistant) -> None:
+    diffuser = AirversaDiffuser(hass, "24:42:e3:60:f8:7e", 2.0)
+    delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+        diffuser._stop.set()
+
+    with (
+        patch.object(
+            diffuser_mod.bluetooth,
+            "async_ble_device_from_address",
+            return_value=object(),
+        ),
+        patch.object(
+            diffuser,
+            "_async_connect_and_maintain",
+            side_effect=DiffuserError("disconnected"),
+        ),
+        patch.object(diffuser_mod.asyncio, "sleep", fake_sleep),
+    ):
+        await diffuser._run()
+    assert delays == [diffuser_mod.RECONNECT_DELAY]

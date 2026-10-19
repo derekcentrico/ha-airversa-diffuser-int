@@ -71,12 +71,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         sync_state=entry.options.get(CONF_SYNC_STATE, DEFAULT_SYNC_STATE),
         advertised_firmware=firmware,
     )
-    await diffuser.async_start()
-
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = diffuser
-
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
     @callback
     def _on_model(reported: str) -> None:
@@ -89,7 +84,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             entry, data={**entry.data, CONF_MODEL: reported}
         )
 
+    # Listeners go in before the link starts so an early model frame is
+    # not missed.
     entry.async_on_unload(diffuser.add_model_listener(_on_model))
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    await diffuser.async_start()
     return True
 
 

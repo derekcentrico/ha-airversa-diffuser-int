@@ -42,6 +42,7 @@ LOGIN_TIMEOUT = 3.0
 SYNC_TIMEOUT = 6.0
 ACK_TIMEOUT = 2.0
 COMMAND_ATTEMPTS = 3
+QUEUE_TTL = 300.0  # drop a power command queued while offline after this
 
 # Models with a mode/intensity frame (0x3b/0x5b).
 MODE_MODELS = frozenset({"ANP"})

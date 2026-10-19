@@ -51,5 +51,5 @@ set_schedule:
       selector:
         number:
           min: 1
-          max: 4
+          max: 9
           mode: box

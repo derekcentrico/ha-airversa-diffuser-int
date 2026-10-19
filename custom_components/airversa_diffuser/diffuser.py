@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -40,6 +41,7 @@ from .const import (
     KEEPALIVE_SETTLE,
     LOGIN_TIMEOUT,
     PIN_REJECTED_DELAY,
+    QUEUE_TTL,
     RECONNECT_DELAY,
     SYNC_TIMEOUT,
 )
@@ -52,10 +54,19 @@ _LEGACY_ACK_OFF = bytes.fromhex("ad12")
 
 SOURCE_DEVICE = "device"
 SOURCE_COMMAND = "command"
+# Device-reported state from an earlier session, not yet refreshed.
+SOURCE_PREVIOUS = "previous_session"
+
+# Pushes that may carry user-chosen text; logged by head only.
+_PRIVATE_PUSHES = frozenset({p.PUSH_NAME, p.PUSH_LABEL})
 
 
 class DiffuserError(Exception):
     """Raised when a command cannot be delivered or confirmed."""
+
+
+class PinRejectedError(DiffuserError):
+    """Raised when the device answers the login with ERROR."""
 
 
 @dataclass(slots=True)
@@ -105,8 +116,10 @@ class AirversaDiffuser:
         self._power_source: str | None = None
         self._muted: bool | None = None
         self._muted_source: str | None = None
-        # Power requested while disconnected; sent once the link is up.
+        # Power requested while disconnected; sent once the link is up
+        # unless it has gone stale.
         self._queued_power: bool | None = None
+        self._queued_at = 0.0
         # Last requested power, re-sent on reconnect only for devices that
         # never report their own state (pre-existing behaviour).
         self._desired: bool | None = None
@@ -236,6 +249,7 @@ class AirversaDiffuser:
         self._desired = on
         if not self._link_ready():
             self._queued_power = on
+            self._queued_at = time.monotonic()
             _LOGGER.debug(
                 "%s: queued %s (not connected yet)",
                 self.address,
@@ -263,12 +277,10 @@ class AirversaDiffuser:
             frame, confirm_pushes=frozenset({p.PUSH_CONTROL})
         )
         if ack is None:
-            _LOGGER.warning(
-                "%s: no acknowledgement for %s; state left unchanged",
-                self.address,
-                "ON" if on else "OFF",
+            raise DiffuserError(
+                f"no acknowledgement for {'ON' if on else 'OFF'}; "
+                "state left unchanged"
             )
-            return
         if ack and ack[0] == p.PUSH_CONTROL:
             # The device answered with its real state; already applied.
             return
@@ -405,7 +417,26 @@ class AirversaDiffuser:
                     raise DiffuserError(f"write failed: {err}") from err
                 finally:
                     self._pending = None
+            await self._async_drain_late_ack(frame[0], timeout)
             return None
+
+    async def _async_drain_late_ack(self, head: int, timeout: float) -> None:
+        """Swallow a late ACK so it cannot confirm the next same-type command.
+
+        Single-byte ACKs carry no request id. Holding the lock for one more
+        window after a failed command keeps a straggler from the last retry
+        away from whatever is queued behind it.
+        """
+        loop = asyncio.get_running_loop()
+        sink: asyncio.Future[bytes] = loop.create_future()
+        self._pending = _Pending(head, frozenset(), sink)
+        try:
+            await asyncio.wait_for(sink, timeout)
+            _LOGGER.debug("%s: discarded late ACK", self.address)
+        except TimeoutError:
+            pass
+        finally:
+            self._pending = None
 
     # ----------------------------------------------------------- ble notify
     @callback
@@ -414,7 +445,9 @@ class AirversaDiffuser:
         if not payload:
             return
         head = payload[0]
-        if head != p.PUSH_STATUS:
+        if head in _PRIVATE_PUSHES:
+            _LOGGER.debug("%s: rx %02x (text)", self.address, head)
+        elif head != p.PUSH_STATUS:
             # Status frames arrive every second; keep them out of the log.
             _LOGGER.debug("%s: rx %s", self.address, payload.hex())
 
@@ -440,7 +473,10 @@ class AirversaDiffuser:
             if not pending.future.done():
                 pending.future.set_result(payload)
             return
-        if payload in (_LEGACY_ACK_ON, _LEGACY_ACK_OFF):
+        if (
+            payload in (_LEGACY_ACK_ON, _LEGACY_ACK_OFF)
+            and self._power_source != SOURCE_DEVICE
+        ):
             # Unsolicited legacy echo, e.g. a late ACK after a retry.
             self._power = payload == _LEGACY_ACK_ON
             self._power_source = SOURCE_COMMAND
@@ -549,10 +585,13 @@ class AirversaDiffuser:
                 await self._async_connect_and_maintain(device)
             except asyncio.CancelledError:
                 raise
-            except DiffuserError as err:
+            except PinRejectedError as err:
                 self.last_error = str(err)
                 _LOGGER.warning("%s: %s", self.address, err)
                 delay = PIN_REJECTED_DELAY
+            except DiffuserError as err:
+                self.last_error = str(err)
+                _LOGGER.debug("%s: %s", self.address, err)
             except Exception as err:  # noqa: BLE001 - keep the loop alive
                 self.last_error = str(err)
                 _LOGGER.debug("%s: connection error: %s", self.address, err)
@@ -605,7 +644,7 @@ class AirversaDiffuser:
 
         login = p.parse_login_reply(raw)
         if not login.ok:
-            raise DiffuserError("device rejected the PIN")
+            raise PinRejectedError("device rejected the PIN")
         self.snapshot.login = login
         if login.firmware:
             self.firmware = login.firmware
@@ -644,7 +683,7 @@ class AirversaDiffuser:
             disconnected_callback=self._on_disconnect,
         )
         self._client = client
-        self.snapshot.control = None
+        self._mark_previous_session()
         try:
             await client.start_notify(p.CHAR_UUID, self._on_notify)
             await asyncio.sleep(HANDSHAKE_SETTLE)
@@ -681,10 +720,20 @@ class AirversaDiffuser:
             except Exception as err:  # noqa: BLE001 - best-effort cleanup
                 _LOGGER.debug("%s: stop_notify failed: %s", self.address, err)
 
+    def _mark_previous_session(self) -> None:
+        """Demote last session's device state until the device re-reports it."""
+        self.snapshot.control = None
+        self.snapshot.status = None
+        if self._power_source == SOURCE_DEVICE:
+            self._power_source = SOURCE_PREVIOUS
+        if self._muted_source == SOURCE_DEVICE:
+            self._muted_source = SOURCE_PREVIOUS
+
     async def _async_apply_after_connect(self) -> None:
         """Send queued work. Never overwrite state the device just reported."""
         target: bool | None = None
-        if self._queued_power is not None:
+        queued_fresh = time.monotonic() - self._queued_at < QUEUE_TTL
+        if self._queued_power is not None and queued_fresh:
             target = self._queued_power
         elif self._desired is not None and self.snapshot.control is None:
             # Device does not report state: keep the old re-apply behaviour.

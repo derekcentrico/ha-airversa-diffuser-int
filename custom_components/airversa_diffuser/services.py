@@ -23,7 +23,7 @@ from homeassistant.helpers import (
 
 from .const import DOMAIN
 from .diffuser import AirversaDiffuser, DiffuserError
-from .protocol import Schedule, pause_range
+from .protocol import ProtocolError, Schedule, pause_range
 
 SERVICE_SET_SCHEDULE = "set_schedule"
 
@@ -80,7 +80,7 @@ def async_setup_services(hass: HomeAssistant) -> None:
         schedule = build_schedule_from_call(diffuser, call.data)
         try:
             await diffuser.async_set_schedule(schedule)
-        except DiffuserError as err:
+        except (DiffuserError, ProtocolError) as err:
             raise HomeAssistantError(str(err)) from err
 
     hass.services.async_register(
@@ -132,6 +132,17 @@ def build_schedule_from_call(
             pause=100,
         )
 
+    custom = bool(
+        diffuser.snapshot.login and diffuser.snapshot.login.custom_timing
+    )
+    timing = ATTR_MIST in data or ATTR_PAUSE in data
+    if timing and ATTR_INTENSITY in data:
+        raise ServiceValidationError("give intensity or mist/pause, not both")
+    if timing and not custom:
+        raise ServiceValidationError(
+            "this diffuser has not reported custom mist/pause support"
+        )
+
     schedule = replace(current, shown=True)
     if ATTR_ENABLED in data:
         schedule.enabled = data[ATTR_ENABLED]
@@ -153,7 +164,7 @@ def build_schedule_from_call(
             )
         schedule.work_mode = 0
         schedule.grade = data[ATTR_INTENSITY]
-    if ATTR_MIST in data or ATTR_PAUSE in data:
+    if timing:
         schedule.work_mode = 1
         if ATTR_MIST in data:
             schedule.mist = data[ATTR_MIST]

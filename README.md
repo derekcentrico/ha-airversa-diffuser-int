@@ -124,11 +124,15 @@ its full state. Once the device reports power the switch shows it as
 confirmed (`state_source: device`). If only a command acknowledgement is
 available the state is marked as assumed (`assumed_state: true`,
 `state_source: command`) so the UI shows both on and off buttons. A command
-that is never acknowledged leaves the state unchanged and logs a warning.
+that is never acknowledged leaves the state unchanged and the service call
+fails, so automations can see it.
 
 The switch is `unavailable` while the BLE link is down and recovers on
-reconnect. On reconnect, state the device just reported is never overwritten.
-A command issued while disconnected is sent once the link is back.
+reconnect. After a reconnect, last session's state is shown as assumed
+(`state_source: previous_session`) until the device reports again, and state
+the device reports is never overwritten. A power command issued while
+disconnected is sent once the link is back, unless more than five minutes
+have passed.
 
 ## Services
 

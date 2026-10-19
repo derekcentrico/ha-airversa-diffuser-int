@@ -8,9 +8,11 @@
 - Send the clock after login so the diffuser reports its state. Power and
   feedback sound now come from the device when it reports them; otherwise
   the switch is marked as assumed state.
-- A command that is never acknowledged no longer flips the switch.
+- A command that is never acknowledged no longer flips the switch; the
+  service call fails instead. A late ACK cannot confirm the next command.
 - Reconnect no longer re-sends the last command over state the device just
-  reported. Commands issued while disconnected are still delivered.
+  reported. Power commands issued while disconnected are still delivered if
+  the link returns within five minutes.
 - Power commands keep the device's mute setting instead of always unmuting.
 - New for the Scenta Plug (ANP): feedback sound switch, intensity select,
   mode select, phase sensor.

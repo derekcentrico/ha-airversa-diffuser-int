@@ -183,6 +183,18 @@ def test_schedule_without_custom_timing_is_short() -> None:
     assert len(p.build_schedule(schedule, custom_timing=False)) == 14
 
 
+def test_schedule_preset_level_on_custom_device_uses_long_form() -> None:
+    schedule = p.Schedule(1, True, True, (8, 0), (20, 0), 0x7F, 0, 3)
+    frame = p.build_schedule(schedule, custom_timing=True)
+    assert len(frame) == 18
+    assert frame[-4:] == bytes.fromhex("000a0064")
+
+
+def test_login_version_regex() -> None:
+    frame = b"\x8f" + b"CY_V3.1OK01"
+    assert p.parse_login_reply(frame).protocol_version == 3.1
+
+
 def test_schedule_validation() -> None:
     bad = p.Schedule(1, True, True, (24, 0), (0, 0), 0x7F, 0, 2)
     with pytest.raises(p.ProtocolError):

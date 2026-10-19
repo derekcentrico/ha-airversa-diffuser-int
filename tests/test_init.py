@@ -12,6 +12,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 
+from custom_components.airversa_diffuser import protocol as p
 from custom_components.airversa_diffuser.const import CONF_MODEL, DOMAIN
 from custom_components.airversa_diffuser.diffuser import AirversaDiffuser
 
@@ -218,6 +219,40 @@ async def test_set_schedule_service(hass: HomeAssistant, no_connect) -> None:
     device = dr.async_get(hass).async_get_device_by_identifier(
         (DOMAIN, ADDRESS), entry.entry_id
     )
+
+    # No login reply yet -> custom timing support unknown.
+    with pytest.raises(ServiceValidationError, match="custom"):
+        await hass.services.async_call(
+            DOMAIN,
+            "set_schedule",
+            {
+                "device_id": device.id,
+                "slot": 1,
+                "start": "07:00",
+                "end": "22:30",
+                "mist": 10,
+                "pause": 100,
+            },
+            blocking=True,
+        )
+    diffuser.snapshot.login = p.parse_login_reply(
+        bytes.fromhex("8f43595f56332e304f4b30310145c210")
+    )
+
+    with pytest.raises(ServiceValidationError, match="not both"):
+        await hass.services.async_call(
+            DOMAIN,
+            "set_schedule",
+            {
+                "device_id": device.id,
+                "slot": 1,
+                "start": "07:00",
+                "end": "22:30",
+                "intensity": 2,
+                "pause": 100,
+            },
+            blocking=True,
+        )
 
     with pytest.raises(ServiceValidationError):
         await hass.services.async_call(

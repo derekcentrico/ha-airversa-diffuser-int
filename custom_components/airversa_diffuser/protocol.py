@@ -17,6 +17,7 @@ Framing rules on characteristic ``fff6``:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import IntEnum
@@ -89,6 +90,12 @@ MODEL_NAMES = {
 
 # Models known to speak the "gw" protocol on service ee01 instead of fff0.
 UNSUPPORTED_MODELS = frozenset({"U1"})
+
+# App defaults, sent when a custom-timing device gets a preset-level schedule.
+DEFAULT_SCHEDULE_MIST = 10
+DEFAULT_SCHEDULE_PAUSE = 100
+
+_VERSION_RE = re.compile(r"V(\d+\.\d+)")
 
 ANP_PAUSE_MIN = 60
 ANP_PAUSE_MIN_LONG_MIST = 75
@@ -224,11 +231,11 @@ def parse_login_reply(frame: bytes) -> LoginReply:
         # Older firmware replies with a short token and no capability bytes.
         return LoginReply(ok=True, protocol_version=2.0)
 
+    # Anything other than ERROR is an accepted login; the vendor app treats
+    # it the same way.
     firmware = text[:7] if len(text) >= 7 else text
-    try:
-        version = float(text[4:7])
-    except ValueError:
-        version = None
+    match = _VERSION_RE.search(text)
+    version = float(match.group(1)) if match else None
     reply = LoginReply(ok=True, firmware=firmware, protocol_version=version)
     if len(frame) > 13:
         caps = frame[13]
@@ -466,10 +473,13 @@ def build_schedule(schedule: Schedule, custom_timing: bool) -> bytes:
         ]
     )
     if custom_timing:
-        if schedule.mist is None or schedule.pause is None:
+        # Custom-timing devices always take the 18-byte form; with a preset
+        # level the trailing seconds are ignored, so app defaults fill in.
+        mist, pause = schedule.mist, schedule.pause
+        if schedule.work_mode == 1 and (mist is None or pause is None):
             raise ProtocolError("custom timing needs mist and pause")
-        frame += schedule.mist.to_bytes(2, "big")
-        frame += schedule.pause.to_bytes(2, "big")
+        frame += (mist or DEFAULT_SCHEDULE_MIST).to_bytes(2, "big")
+        frame += (pause or DEFAULT_SCHEDULE_PAUSE).to_bytes(2, "big")
     return bytes(frame)
 
 
