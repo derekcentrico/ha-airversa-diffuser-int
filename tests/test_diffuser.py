@@ -809,6 +809,7 @@ async def test_mode_confirmed_by_read_back(
         return []
 
     diffuser, client = make(hass, device)
+    diffuser.advertised_firmware = "11.1.2"
     diffuser._on_notify(None, bytearray(MODE_PRESET_2))
     await diffuser.async_set_grade(1)
     assert diffuser.snapshot.mode.grade == 1
@@ -827,3 +828,59 @@ async def test_mode_read_back_mismatch_raises(
     diffuser._on_notify(None, bytearray(MODE_PRESET_2))
     with pytest.raises(DiffuserError, match="mode 0 intensity 2"):
         await diffuser.async_set_grade(1)
+
+
+async def test_mode_read_back_skips_stale_push(
+    hass: HomeAssistant, fast_timeouts
+) -> None:
+    """An old 0x5b ahead of the dump must not decide the result."""
+    applied: list[bytes] = []
+
+    def device(frame: bytes) -> list[bytes]:
+        if frame[0] == p.CMD_MODE:
+            applied.append(bytes([p.PUSH_MODE]) + frame[1:])
+            return []
+        if frame[0] == p.CMD_TIME and applied:
+            return [MODE_PRESET_2, applied[-1]]
+        return []
+
+    diffuser, _ = make(hass, device)
+    diffuser._on_notify(None, bytearray(MODE_PRESET_2))
+    await diffuser.async_set_grade(3)
+    assert diffuser.snapshot.mode.grade == 3
+
+
+async def test_mode_resent_on_firmware_that_acks(
+    hass: HomeAssistant, fast_timeouts
+) -> None:
+    def device(frame: bytes) -> list[bytes]:
+        if frame[0] == p.CMD_TIME:
+            return [MODE_PRESET_2]
+        return []
+
+    diffuser, client = make(hass, device)
+    diffuser._on_notify(None, bytearray(MODE_PRESET_2))
+    with pytest.raises(DiffuserError):
+        await diffuser.async_set_mode(p.Mode.CUSTOM)
+    assert (
+        sum(w[0] == p.CMD_MODE for w in client.writes)
+        == diffuser_mod.COMMAND_ATTEMPTS
+    )
+
+
+async def test_concurrent_mode_changes_are_serialised(
+    hass: HomeAssistant, fast_timeouts
+) -> None:
+    def device(frame: bytes) -> list[bytes]:
+        if frame[0] == p.CMD_MODE:
+            return [bytes([p.PUSH_MODE]) + frame[1:]]
+        return []
+
+    diffuser, client = make(hass, device)
+    diffuser._on_notify(None, bytearray(MODE_PRESET_2))
+    await asyncio.gather(
+        diffuser.async_set_grade(1), diffuser.async_set_grade(4)
+    )
+    modes = [w for w in client.writes if w[0] == p.CMD_MODE]
+    assert [w[3] for w in modes] == [1, 4]
+    assert diffuser.snapshot.mode.grade == 4

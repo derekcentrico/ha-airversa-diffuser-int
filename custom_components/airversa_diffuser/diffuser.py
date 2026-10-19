@@ -43,6 +43,7 @@ from .const import (
     PIN_REJECTED_DELAY,
     QUEUE_TTL,
     RECONNECT_DELAY,
+    SILENT_MODE_FIRMWARE,
     SYNC_TIMEOUT,
 )
 
@@ -108,6 +109,9 @@ class AirversaDiffuser:
         # Power and mute share one byte; this lock covers reading the
         # current pair and writing the new one.
         self._power_lock = asyncio.Lock()
+        # Mode writes are read-modify-write on the last 0x5b plus a read-back;
+        # one at a time so a check never validates someone else's request.
+        self._mode_lock = asyncio.Lock()
         # Every GATT write goes through one queue, like the vendor app.
         self._write_lock = asyncio.Lock()
         self._pending: _Pending | None = None
@@ -347,20 +351,30 @@ class AirversaDiffuser:
 
     async def async_set_grade(self, grade: int) -> None:
         """Select a preset intensity level. Switches the device to preset mode."""
-        mode = self._require_mode()
         max_grade = self.max_grade
         if not 1 <= grade <= max_grade:
             raise DiffuserError(f"intensity must be 1-{max_grade}")
-        await self._async_send_mode(
-            p.Mode.PRESET, mode.work_mode, grade, mode.on_time, mode.off_time
-        )
+        async with self._mode_lock:
+            mode = self._require_mode()
+            await self._async_send_mode(
+                p.Mode.PRESET,
+                mode.work_mode,
+                grade,
+                mode.on_time,
+                mode.off_time,
+            )
 
     async def async_set_mode(self, mode_value: int) -> None:
         """Switch the operating mode (ANP)."""
-        mode = self._require_mode()
-        await self._async_send_mode(
-            mode_value, mode.work_mode, mode.grade, mode.on_time, mode.off_time
-        )
+        async with self._mode_lock:
+            mode = self._require_mode()
+            await self._async_send_mode(
+                mode_value,
+                mode.work_mode,
+                mode.grade,
+                mode.on_time,
+                mode.off_time,
+            )
 
     async def _async_send_mode(
         self,
@@ -375,7 +389,7 @@ class AirversaDiffuser:
             int(mode_value), work_mode, grade, on_time or 0, off_time or 0
         )
 
-        def applied(_push: bytes) -> bool:
+        def applied() -> bool:
             state = self.snapshot.mode
             return (
                 state is not None
@@ -384,12 +398,13 @@ class AirversaDiffuser:
             )
 
         # Firmware 11.1.2 neither acks 0x3b nor pushes 0x5b afterwards, so
-        # one write is enough; a resend would only repeat the change.
+        # resending only delays the read-back below.
+        silent = self.advertised_firmware == SILENT_MODE_FIRMWARE
         ack = await self._async_command(
             frame,
             confirm_pushes=frozenset({p.PUSH_MODE}),
-            matches=applied,
-            attempts=1,
+            matches=lambda _push: applied(),
+            attempts=1 if silent else None,
         )
         if ack is None:
             ack = await self._async_read_back_mode(applied)
@@ -400,7 +415,7 @@ class AirversaDiffuser:
             self._notify_listeners()
 
     async def _async_read_back_mode(
-        self, applied: Callable[[bytes], bool]
+        self, applied: Callable[[], bool]
     ) -> bytes:
         """Ask for a state dump and check the mode the device reports."""
         async with self._cmd_lock:
@@ -414,14 +429,27 @@ class AirversaDiffuser:
                 )
             except BleakError as err:
                 raise DiffuserError(f"write failed: {err}") from err
-            try:
-                await asyncio.wait_for(self._mode_seen.wait(), SYNC_TIMEOUT)
-            except TimeoutError as err:
+            # A stale 0x5b can land before the dump; keep waiting for one
+            # that shows the change until the dump window closes.
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + SYNC_TIMEOUT
+            seen = False
+            while not applied():
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                try:
+                    await asyncio.wait_for(self._mode_seen.wait(), remaining)
+                except TimeoutError:
+                    break
+                seen = True
+                self._mode_seen.clear()
+            if not seen and not applied():
                 raise DiffuserError(
                     "device did not report its mode after the change"
-                ) from err
+                )
         state = self.snapshot.mode
-        if state is None or not applied(b""):
+        if state is None or not applied():
             raise DiffuserError(
                 "device reports mode "
                 f"{state.mode if state else '?'} "
