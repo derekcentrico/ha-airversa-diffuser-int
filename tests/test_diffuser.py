@@ -676,3 +676,103 @@ async def test_direct_command_clears_queue(hass: HomeAssistant) -> None:
     await diffuser.async_turn_off()
     assert diffuser._queued_power is None
     assert diffuser._desired is False
+
+
+async def test_stale_offline_request_not_reapplied(
+    hass: HomeAssistant, fast_timeouts
+) -> None:
+    """An expired queued request must not come back through re-apply."""
+    diffuser = AirversaDiffuser(hass, "24:42:e3:60:f8:7e", 2.0, model=None)
+    await diffuser.async_turn_on()
+    diffuser._queued_at -= diffuser_mod.QUEUE_TTL + 1
+    client = FakeClient(diffuser, single_byte_acks)
+    diffuser._stop.set()
+    with patch.object(
+        diffuser_mod, "establish_connection", return_value=client
+    ):
+        await diffuser._async_connect_and_maintain(object())
+    assert not any(w[0] == p.CMD_POWER for w in client.writes)
+
+
+async def test_no_reapply_after_sync_timeout_on_reporting_device(
+    hass: HomeAssistant, fast_timeouts
+) -> None:
+    diffuser, _ = make(hass, single_byte_acks)
+    diffuser._on_notify(None, bytearray.fromhex("4d00"))
+    await diffuser.async_turn_on()
+    client = FakeClient(diffuser, silent)
+    diffuser._stop.set()
+    with patch.object(
+        diffuser_mod, "establish_connection", return_value=client
+    ):
+        await diffuser._async_connect_and_maintain(object())
+    assert not any(w[0] == p.CMD_POWER for w in client.writes)
+
+
+async def test_mismatched_push_does_not_confirm(
+    hass: HomeAssistant, fast_timeouts
+) -> None:
+    """A button press reported mid-command is not the command's reply."""
+
+    def device(frame: bytes) -> list[bytes]:
+        if frame[0] == p.CMD_POWER:
+            return [bytes.fromhex("4d00")]
+        return []
+
+    diffuser, _ = make(hass, device)
+    with pytest.raises(DiffuserError):
+        await diffuser.async_turn_on()
+    assert diffuser.is_on is False
+
+
+async def test_ack_after_confirming_push_is_drained(
+    hass: HomeAssistant, fast_timeouts
+) -> None:
+    """The trailing ACK of a push-confirmed ON must not confirm the OFF."""
+    sent = 0
+
+    def device(frame: bytes) -> list[bytes]:
+        nonlocal sent
+        if frame[0] != p.CMD_POWER:
+            return []
+        sent += 1
+        if sent > 1:
+            return []
+        # ACK trails the push and lands after the caller has its answer.
+        asyncio.get_running_loop().call_later(
+            0.02, diffuser._on_notify, None, bytearray(b"\xad")
+        )
+        return [bytes.fromhex("4d01")]
+
+    diffuser, _ = make(hass, device)
+    await diffuser.async_turn_on()
+    assert diffuser.is_on is True
+    with pytest.raises(DiffuserError):
+        await diffuser.async_turn_off()
+    assert diffuser.is_on is True
+
+
+async def test_schedule_push_for_other_slot_does_not_confirm(
+    hass: HomeAssistant, fast_timeouts
+) -> None:
+    def device(frame: bytes) -> list[bytes]:
+        if frame[0] == p.CMD_SCHEDULE:
+            other = bytearray(frame)
+            other[0] = p.PUSH_SCHEDULE
+            other[5] = 2
+            return [bytes(other)]
+        return []
+
+    diffuser, _ = make(hass, device)
+    schedule = p.Schedule(
+        index=1,
+        enabled=True,
+        shown=True,
+        start=(7, 0),
+        end=(22, 0),
+        days=0x7F,
+        work_mode=0,
+        grade=2,
+    )
+    with pytest.raises(DiffuserError):
+        await diffuser.async_set_schedule(schedule)

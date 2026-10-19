@@ -70,6 +70,9 @@ class _Pending:
     head: int
     confirm_pushes: frozenset[int]
     future: asyncio.Future[bytes]
+    # Checked against the raw push after it is applied; a push that does
+    # not show the requested change (a button press, say) is not a reply.
+    matches: Callable[[bytes], bool] | None = None
 
 
 class AirversaDiffuser:
@@ -124,6 +127,9 @@ class AirversaDiffuser:
         # Last requested power, re-sent on reconnect only for devices that
         # never report their own state (pre-existing behaviour).
         self._desired: bool | None = None
+        # Set once the device has pushed 0x4d; a later sync timeout is then
+        # not a reason to fall back to re-applying the last request.
+        self._reports_power = False
         self.last_error: str | None = None
 
         self._listeners: set[CALLBACK_TYPE] = set()
@@ -264,7 +270,6 @@ class AirversaDiffuser:
 
     async def _async_set_power(self, on: bool) -> None:
         if not self._link_ready():
-            self._desired = on
             self._queued_power = on
             self._queued_at = time.monotonic()
             _LOGGER.debug(
@@ -297,8 +302,17 @@ class AirversaDiffuser:
     async def _async_send_power(self, on: bool, muted: bool) -> None:
         frame = p.build_power(on, muted)
         control_before = self.snapshot.control
+
+        def applied(_push: bytes) -> bool:
+            control = self.snapshot.control
+            return (
+                control is not None
+                and control.power == on
+                and control.muted == muted
+            )
+
         ack = await self._async_command(
-            frame, confirm_pushes=frozenset({p.PUSH_CONTROL})
+            frame, confirm_pushes=frozenset({p.PUSH_CONTROL}), matches=applied
         )
         if ack is None:
             raise DiffuserError(
@@ -359,8 +373,17 @@ class AirversaDiffuser:
         frame = p.build_mode(
             int(mode_value), work_mode, grade, on_time or 0, off_time or 0
         )
+
+        def applied(_push: bytes) -> bool:
+            state = self.snapshot.mode
+            return (
+                state is not None
+                and state.mode == int(mode_value)
+                and (state.mode != p.Mode.PRESET or state.grade == grade)
+            )
+
         ack = await self._async_command(
-            frame, confirm_pushes=frozenset({p.PUSH_MODE})
+            frame, confirm_pushes=frozenset({p.PUSH_MODE}), matches=applied
         )
         if ack is None:
             raise DiffuserError("device did not confirm the mode change")
@@ -378,7 +401,9 @@ class AirversaDiffuser:
         )
         frame = p.build_schedule(schedule, custom)
         ack = await self._async_command(
-            frame, confirm_pushes=frozenset({p.PUSH_SCHEDULE})
+            frame,
+            confirm_pushes=frozenset({p.PUSH_SCHEDULE}),
+            matches=lambda push: push[5] == schedule.index,
         )
         if ack is None:
             raise DiffuserError("device did not confirm the schedule write")
@@ -413,6 +438,7 @@ class AirversaDiffuser:
         frame: bytes,
         *,
         confirm_pushes: frozenset[int] = frozenset(),
+        matches: Callable[[bytes], bool] | None = None,
         attempts: int | None = None,
         timeout: float | None = None,
     ) -> bytes | None:
@@ -430,11 +456,13 @@ class AirversaDiffuser:
                 if client is None or not client.is_connected:
                     raise DiffuserError("not connected")
                 future: asyncio.Future[bytes] = loop.create_future()
-                self._pending = _Pending(frame[0], confirm_pushes, future)
+                self._pending = _Pending(
+                    frame[0], confirm_pushes, future, matches
+                )
                 try:
                     _LOGGER.debug("%s: tx %s", self.address, frame.hex())
                     await self._async_write(client, frame)
-                    return await asyncio.wait_for(future, timeout)
+                    reply = await asyncio.wait_for(future, timeout)
                 except TimeoutError:
                     _LOGGER.debug(
                         "%s: no ACK for %s (attempt %d/%d)",
@@ -445,6 +473,13 @@ class AirversaDiffuser:
                     )
                 except BleakError as err:
                     raise DiffuserError(f"write failed: {err}") from err
+                else:
+                    self._pending = None
+                    if not reply[0] & 0x80:
+                        # Confirmed by a push; the real ACK may still be on
+                        # its way and must not confirm the next command.
+                        await self._async_drain_late_ack(frame[0], timeout)
+                    return reply
                 finally:
                     self._pending = None
             await self._async_drain_late_ack(frame[0], timeout)
@@ -527,6 +562,7 @@ class AirversaDiffuser:
 
         if handled == p.PUSH_CONTROL and self.snapshot.control is not None:
             control = self.snapshot.control
+            self._reports_power = True
             self._power = control.power
             self._power_source = SOURCE_DEVICE
             self._muted = control.muted
@@ -543,6 +579,7 @@ class AirversaDiffuser:
             pending is not None
             and handled in pending.confirm_pushes
             and not pending.future.done()
+            and (pending.matches is None or pending.matches(payload))
         ):
             pending.future.set_result(payload)
 
@@ -761,7 +798,11 @@ class AirversaDiffuser:
         queued_fresh = time.monotonic() - self._queued_at < QUEUE_TTL
         if self._queued_power is not None and queued_fresh:
             target = self._queued_power
-        elif self._desired is not None and self.snapshot.control is None:
+        elif (
+            self._desired is not None
+            and self.snapshot.control is None
+            and not self._reports_power
+        ):
             # Device does not report state: keep the old re-apply behaviour.
             target = self._desired
         self._queued_power = None
