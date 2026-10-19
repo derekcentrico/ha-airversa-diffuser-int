@@ -1,0 +1,8 @@
+pytest-homeassistant-custom-component
+ruff
+# Requirements of the bluetooth component, which the test plugin does not pull in
+aiousbwatcher
+bluetooth-adapters
+bluetooth-auto-recovery
+dbus-fast
+serialx

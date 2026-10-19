@@ -14,6 +14,9 @@
         }
       }
     },
+    "error": {
+      "invalid_address": "Enter a MAC address like 24:42:E3:60:F8:7E."
+    },
     "abort": {
       "already_configured": "This diffuser is already configured.",
       "no_devices_found": "No diffusers found."
@@ -24,10 +27,99 @@
       "init": {
         "title": "Airversa diffuser options",
         "data": {
-          "keepalive_seconds": "Keepalive interval (seconds)"
+          "keepalive_seconds": "Keepalive interval (seconds)",
+          "pin": "Device PIN",
+          "sync_state": "Read state from the device"
         },
         "data_description": {
-          "keepalive_seconds": "How often the keepalive frame is sent over the open BLE link. Lower this if the session ever times out."
+          "keepalive_seconds": "How often the keepalive frame is sent over the open BLE link. Lower this if the session ever times out.",
+          "pin": "PIN used at login. Factory default is 8888; change it only if you set a different one in the Sleekpoint app.",
+          "sync_state": "After login, send the clock so the diffuser reports power, sound, mode and schedules. Turn off to fall back to command-only behaviour."
+        }
+      }
+    }
+  },
+  "entity": {
+    "switch": {
+      "feedback_sound": {
+        "name": "Feedback sound"
+      }
+    },
+    "select": {
+      "intensity": {
+        "name": "Intensity",
+        "state": {
+          "1": "Level 1",
+          "2": "Level 2",
+          "3": "Level 3",
+          "4": "Level 4"
+        }
+      },
+      "mode": {
+        "name": "Mode",
+        "state": {
+          "preset": "Preset",
+          "custom": "Custom schedules",
+          "light_sensor": "Light sensor"
+        }
+      }
+    },
+    "sensor": {
+      "phase": {
+        "name": "Phase",
+        "state": {
+          "idle": "Idle",
+          "misting": "Misting",
+          "paused": "Paused"
+        },
+        "state_attributes": {
+          "slot": {
+            "name": "Slot"
+          }
+        }
+      }
+    }
+  },
+  "services": {
+    "set_schedule": {
+      "name": "Set schedule",
+      "description": "Write one native schedule slot on the diffuser. Fields left out keep the value the device last reported.",
+      "fields": {
+        "device_id": {
+          "name": "Device",
+          "description": "Diffuser to program."
+        },
+        "slot": {
+          "name": "Slot",
+          "description": "Schedule slot, 1 to 5."
+        },
+        "enabled": {
+          "name": "Enabled",
+          "description": "Whether the schedule is active."
+        },
+        "start": {
+          "name": "Start",
+          "description": "Start time. Same start and end means all day."
+        },
+        "end": {
+          "name": "End",
+          "description": "End time."
+        },
+        "days": {
+          "name": "Days",
+          "description": "Days the schedule runs."
+        },
+        "mist": {
+          "name": "Mist time",
+          "description": "Seconds of mist per cycle. Use with pause; replaces intensity."
+        },
+        "pause": {
+          "name": "Pause time",
+          "description": "Seconds between mists. ANP allows 60 to 3600 (75 minimum when mist is 15 s or longer)."
+        },
+        "intensity": {
+          "name": "Intensity",
+          "description": "Preset level instead of custom mist and pause."
         }
       }
     }
