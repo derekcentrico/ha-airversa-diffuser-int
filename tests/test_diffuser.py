@@ -618,8 +618,10 @@ async def test_invalid_pin_setting_is_config_error(
     assert client.writes == []
 
 
-async def test_push_during_command_wins(hass: HomeAssistant) -> None:
-    """A control push that lands before the ACK is the device's real state."""
+async def test_stale_push_before_ack_does_not_override(
+    hass: HomeAssistant,
+) -> None:
+    """A non-matching 0x4d ahead of the ACK predates the command."""
 
     def device(frame: bytes) -> list[bytes]:
         if frame[0] == p.CMD_POWER:
@@ -628,8 +630,21 @@ async def test_push_during_command_wins(hass: HomeAssistant) -> None:
 
     diffuser, _ = make(hass, device)
     await diffuser.async_turn_on()
-    assert diffuser.is_on is False
-    assert diffuser.muted is True
+    assert diffuser.is_on is True
+    assert diffuser.power_source == SOURCE_COMMAND
+
+
+async def test_matching_push_before_ack_is_device_state(
+    hass: HomeAssistant,
+) -> None:
+    def device(frame: bytes) -> list[bytes]:
+        if frame[0] == p.CMD_POWER:
+            return [bytes.fromhex("4d01"), b"\xad"]
+        return []
+
+    diffuser, _ = make(hass, device)
+    await diffuser.async_turn_on()
+    assert diffuser.is_on is True
     assert diffuser.power_reported
 
 

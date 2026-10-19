@@ -306,10 +306,6 @@ class AirversaDiffuser:
 
     async def _async_send_power(self, on: bool, muted: bool) -> None:
         frame = p.build_power(on, muted)
-        # Taken when the frame actually goes out, not when the call starts:
-        # a state dump that lands while this waits for the command lock
-        # predates the command and must not override it.
-        sent_with: list[p.ControlState | None] = []
 
         def applied(_push: bytes) -> bool:
             control = self.snapshot.control
@@ -323,19 +319,18 @@ class AirversaDiffuser:
             frame,
             confirm_pushes=frozenset({p.PUSH_CONTROL}),
             matches=applied,
-            before_write=lambda: sent_with.append(self.snapshot.control),
         )
         if ack is None:
             raise DiffuserError(
                 f"no acknowledgement for {'ON' if on else 'OFF'}; "
                 "state left unchanged"
             )
-        if ack[0] == p.PUSH_CONTROL or (
-            sent_with and self.snapshot.control is not sent_with[0]
-        ):
-            # The device reported its real state while the command was in
-            # flight; that already applied and wins over the request.
+        if ack[0] == p.PUSH_CONTROL or applied(ack):
+            # The device itself reported the requested state.
             return
+        # The device handles frames in order, so a 0x4d that arrived before
+        # this ACK without the requested state describes the state before
+        # the command (a dump in flight, for one) and the ACK supersedes it.
         if len(ack) == 2 and ack[1] & 0x12 == 0x12:
             # Older firmware echoes the value it applied; trust that over
             # what was requested.
@@ -510,7 +505,6 @@ class AirversaDiffuser:
         *,
         confirm_pushes: frozenset[int] = frozenset(),
         matches: Callable[[bytes], bool] | None = None,
-        before_write: Callable[[], None] | None = None,
         attempts: int | None = None,
         timeout: float | None = None,
     ) -> bytes | None:
@@ -531,8 +525,6 @@ class AirversaDiffuser:
                 self._pending = _Pending(
                     frame[0], confirm_pushes, future, matches
                 )
-                if attempt == 1 and before_write is not None:
-                    before_write()
                 try:
                     _LOGGER.debug("%s: tx %s", self.address, frame.hex())
                     await self._async_write(client, frame)
