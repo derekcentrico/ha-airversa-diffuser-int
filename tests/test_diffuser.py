@@ -570,3 +570,49 @@ async def test_transient_error_uses_short_delay(hass: HomeAssistant) -> None:
     ):
         await diffuser._run()
     assert delays == [diffuser_mod.RECONNECT_DELAY]
+
+
+async def test_concurrent_sound_and_power_use_fresh_state(
+    hass: HomeAssistant,
+) -> None:
+    """Mute change queued behind OFF must keep the new power bit."""
+    diffuser, client = make(hass, single_byte_acks)
+    diffuser._on_notify(None, bytearray.fromhex("4d01"))
+    await asyncio.gather(
+        diffuser.async_turn_off(), diffuser.async_set_sound(False)
+    )
+    assert client.writes == [bytes.fromhex("2d12"), bytes.fromhex("2d52")]
+    assert diffuser.is_on is False
+    assert diffuser.muted is True
+
+
+async def test_legacy_echo_mismatch_applies_echo(hass: HomeAssistant) -> None:
+    diffuser, _ = make(hass, lambda f: [bytes.fromhex("ad12")])
+    await diffuser.async_turn_on()
+    assert diffuser.is_on is False
+
+
+async def test_sound_refused_with_previous_session_power(
+    hass: HomeAssistant,
+) -> None:
+    diffuser, client = make(hass, single_byte_acks)
+    diffuser._power = True
+    diffuser._power_source = diffuser_mod.SOURCE_PREVIOUS
+    with pytest.raises(DiffuserError, match="not confirmed"):
+        await diffuser.async_set_sound(False)
+    assert client.writes == []
+
+
+async def test_invalid_pin_setting_is_config_error(
+    hass: HomeAssistant, fast_timeouts
+) -> None:
+    diffuser = AirversaDiffuser(hass, "24:42:e3:60:f8:7e", 2.0, pin="")
+    client = FakeClient(diffuser, silent)
+    with (
+        patch.object(
+            diffuser_mod, "establish_connection", return_value=client
+        ),
+        pytest.raises(diffuser_mod.PinRejectedError),
+    ):
+        await diffuser._async_connect_and_maintain(object())
+    assert client.writes == []

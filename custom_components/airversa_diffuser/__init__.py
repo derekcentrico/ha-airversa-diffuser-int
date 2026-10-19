@@ -89,8 +89,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry.async_on_unload(diffuser.add_model_listener(_on_model))
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    await diffuser.async_start()
+    try:
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        await diffuser.async_start()
+    except Exception:
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+        await diffuser.async_stop()
+        raise
     return True
 
 

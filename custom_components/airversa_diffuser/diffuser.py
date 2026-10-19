@@ -106,6 +106,9 @@ class AirversaDiffuser:
         self._run_task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._cmd_lock = asyncio.Lock()
+        # Power and mute share one byte; this lock covers reading the
+        # current pair and writing the new one.
+        self._power_lock = asyncio.Lock()
         self._pending: _Pending | None = None
         self._login_future: asyncio.Future[bytes] | None = None
         self._sync_done = asyncio.Event()
@@ -153,6 +156,14 @@ class AirversaDiffuser:
     def power_reported(self) -> bool:
         """Return True when the device itself reported the power state."""
         return self._power_source == SOURCE_DEVICE
+
+    @property
+    def power_fresh(self) -> bool:
+        """Return True when power is known from this session."""
+        return self._power is not None and self._power_source in (
+            SOURCE_DEVICE,
+            SOURCE_COMMAND,
+        )
 
     @property
     def muted(self) -> bool | None:
@@ -256,7 +267,8 @@ class AirversaDiffuser:
                 "ON" if on else "OFF",
             )
             return
-        await self._async_send_power(on, self._mute_for_write())
+        async with self._power_lock:
+            await self._async_send_power(on, self._mute_for_write())
 
     async def async_set_sound(self, enabled: bool) -> None:
         """Enable or disable the feedback beep.
@@ -264,12 +276,14 @@ class AirversaDiffuser:
         Mute shares a byte with power, so the current power state has to be
         known or the write would also switch the diffuser.
         """
-        if self._power is None:
-            raise DiffuserError(
-                "power state unknown; cannot change sound safely"
-            )
-        self._require_link()
-        await self._async_send_power(self._power, not enabled)
+        async with self._power_lock:
+            if not self.power_fresh:
+                raise DiffuserError(
+                    "power state not confirmed this session; "
+                    "cannot change sound safely"
+                )
+            self._require_link()
+            await self._async_send_power(bool(self._power), not enabled)
 
     async def _async_send_power(self, on: bool, muted: bool) -> None:
         frame = p.build_power(on, muted)
@@ -281,9 +295,14 @@ class AirversaDiffuser:
                 f"no acknowledgement for {'ON' if on else 'OFF'}; "
                 "state left unchanged"
             )
-        if ack and ack[0] == p.PUSH_CONTROL:
+        if ack[0] == p.PUSH_CONTROL:
             # The device answered with its real state; already applied.
             return
+        if len(ack) >= 2:
+            # Older firmware echoes the value it applied; trust that over
+            # what was requested.
+            on = bool(ack[1] & 0x01)
+            muted = bool(ack[1] & 0x40)
         self._power = on
         self._power_source = SOURCE_COMMAND
         self._muted = muted
@@ -630,11 +649,13 @@ class AirversaDiffuser:
     async def _async_login(self, client: BleakClientWithServiceCache) -> None:
         """Send the PIN and decode the reply, if the firmware sends one."""
         loop = asyncio.get_running_loop()
+        try:
+            frame = p.build_login(self.pin)
+        except p.ProtocolError as err:
+            raise PinRejectedError(f"invalid PIN setting: {err}") from err
         self._login_future = loop.create_future()
         try:
-            await client.write_gatt_char(
-                p.CHAR_UUID, p.build_login(self.pin), response=False
-            )
+            await client.write_gatt_char(p.CHAR_UUID, frame, response=False)
             raw = await asyncio.wait_for(self._login_future, LOGIN_TIMEOUT)
         except TimeoutError:
             _LOGGER.debug("%s: no login reply; continuing", self.address)
@@ -724,9 +745,9 @@ class AirversaDiffuser:
         """Demote last session's device state until the device re-reports it."""
         self.snapshot.control = None
         self.snapshot.status = None
-        if self._power_source == SOURCE_DEVICE:
+        if self._power_source is not None:
             self._power_source = SOURCE_PREVIOUS
-        if self._muted_source == SOURCE_DEVICE:
+        if self._muted_source is not None:
             self._muted_source = SOURCE_PREVIOUS
 
     async def _async_apply_after_connect(self) -> None:
@@ -743,6 +764,7 @@ class AirversaDiffuser:
             return
         await asyncio.sleep(HANDSHAKE_SETTLE)
         try:
-            await self._async_send_power(target, self._mute_for_write())
+            async with self._power_lock:
+                await self._async_send_power(target, self._mute_for_write())
         except DiffuserError as err:
             _LOGGER.debug("%s: re-apply failed: %s", self.address, err)

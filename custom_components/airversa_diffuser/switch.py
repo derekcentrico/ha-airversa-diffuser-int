@@ -105,7 +105,7 @@ class AirversaSoundSwitch(AirversaEntity, SwitchEntity):
     @property
     def available(self) -> bool:
         """Return True once power is known, since mute rides on that frame."""
-        return super().available and self._diffuser.is_on is not None
+        return super().available and self._diffuser.power_fresh
 
     @property
     def is_on(self) -> bool | None:

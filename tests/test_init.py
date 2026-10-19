@@ -316,3 +316,21 @@ async def test_unload(hass: HomeAssistant, no_connect) -> None:
     entry = await _setup(hass, "SP1ANP_E360F87E")
     assert await hass.config_entries.async_unload(entry.entry_id)
     assert entry.entry_id not in hass.data[DOMAIN]
+
+
+async def test_unread_slot_on_preset_only_device(
+    hass: HomeAssistant, no_connect
+) -> None:
+    from custom_components.airversa_diffuser.services import (
+        build_schedule_from_call,
+    )
+
+    entry = await _setup(hass, "SP1ANP_E360F87E")
+    diffuser = _diffuser(hass, entry)
+    diffuser.snapshot.login = p.LoginReply(ok=True, custom_timing=False)
+    from datetime import time
+
+    schedule = build_schedule_from_call(
+        diffuser, {"slot": 2, "start": time(8, 0), "end": time(9, 0)}
+    )
+    assert schedule.work_mode == 0

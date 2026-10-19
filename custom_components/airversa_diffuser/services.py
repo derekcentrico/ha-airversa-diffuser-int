@@ -110,6 +110,9 @@ def build_schedule_from_call(
 ) -> Schedule:
     """Merge service data onto the slot the device last reported."""
     slot = data[ATTR_SLOT]
+    custom = bool(
+        diffuser.snapshot.login and diffuser.snapshot.login.custom_timing
+    )
     current = diffuser.snapshot.schedules.get(slot)
     if current is None:
         # Unknown slot: refuse to guess times that could clobber a schedule
@@ -126,15 +129,12 @@ def build_schedule_from_call(
             start=(0, 0),
             end=(23, 0),
             days=0x7F,
-            work_mode=1,
+            work_mode=1 if custom else 0,
             grade=1,
             mist=10,
             pause=100,
         )
 
-    custom = bool(
-        diffuser.snapshot.login and diffuser.snapshot.login.custom_timing
-    )
     timing = ATTR_MIST in data or ATTR_PAUSE in data
     if timing and ATTR_INTENSITY in data:
         raise ServiceValidationError("give intensity or mist/pause, not both")

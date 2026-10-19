@@ -448,6 +448,8 @@ def build_schedule(schedule: Schedule, custom_timing: bool) -> bytes:
             raise ProtocolError("schedule time out of range")
     if not 1 <= schedule.index <= 7:
         raise ProtocolError("schedule index out of range")
+    if not 0 <= schedule.grade <= 0xFF:
+        raise ProtocolError("schedule grade out of range")
     shown = schedule.shown or schedule.enabled
     flags = (
         (0x01 if shown else 0)
@@ -478,8 +480,14 @@ def build_schedule(schedule: Schedule, custom_timing: bool) -> bytes:
         mist, pause = schedule.mist, schedule.pause
         if schedule.work_mode == 1 and (mist is None or pause is None):
             raise ProtocolError("custom timing needs mist and pause")
-        frame += (mist or DEFAULT_SCHEDULE_MIST).to_bytes(2, "big")
-        frame += (pause or DEFAULT_SCHEDULE_PAUSE).to_bytes(2, "big")
+        if mist is None:
+            mist = DEFAULT_SCHEDULE_MIST
+        if pause is None:
+            pause = DEFAULT_SCHEDULE_PAUSE
+        if not (0 <= mist <= 0xFFFF and 0 <= pause <= 0xFFFF):
+            raise ProtocolError("mist/pause out of range")
+        frame += mist.to_bytes(2, "big")
+        frame += pause.to_bytes(2, "big")
     return bytes(frame)
 
 
