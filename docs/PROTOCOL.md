@@ -63,8 +63,10 @@ in frame `0x45` (S).
   (`0x4a`) are answered with three bytes: `ca <aroma> <slot>` (S).
 * `0x59` (status) is never acknowledged in either direction (S D).
 * ANP firmware `11.1.2` does not acknowledge `0x3a` or `0x3b`; the app does
-  not wait for an ACK on that version (S). This integration accepts the
-  following `0x5b` push as confirmation instead.
+  not wait for an ACK on that version (S). On hardware it also sends no
+  matching `0x5b` after a `0x3b`, although the change takes effect (H). This
+  integration sends `0x3b` once, then the clock sync, and checks the mode in
+  the `0x5b` of the resulting state dump.
 
 ## Session start
 
