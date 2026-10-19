@@ -48,6 +48,3 @@ QUEUE_TTL = 300.0  # drop a power command queued while offline after this
 MODE_MODELS = frozenset({"ANP"})
 # Models where the status frame (0x59) has been seen on real hardware.
 STATUS_MODELS = frozenset({"ANP", "ANA"})
-
-# ANP main firmware that applies 0x3b without any reply.
-SILENT_MODE_FIRMWARE = "11.1.2"
