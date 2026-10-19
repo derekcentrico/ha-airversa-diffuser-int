@@ -884,3 +884,19 @@ async def test_concurrent_mode_changes_are_serialised(
     modes = [w for w in client.writes if w[0] == p.CMD_MODE]
     assert [w[3] for w in modes] == [1, 4]
     assert diffuser.snapshot.mode.grade == 4
+
+
+async def test_power_after_queued_dump_uses_request(
+    hass: HomeAssistant, fast_timeouts
+) -> None:
+    """A 0x4d that lands while ON waits for the lock predates the ON."""
+    diffuser, _ = make(hass, single_byte_acks)
+    diffuser._on_notify(None, bytearray.fromhex("4d52"))
+    async with diffuser._cmd_lock:
+        task = asyncio.create_task(diffuser.async_turn_on())
+        await asyncio.sleep(0)
+        # State dump from an earlier read-back, still reporting OFF.
+        diffuser._on_notify(None, bytearray.fromhex("4d52"))
+    await task
+    assert diffuser.is_on is True
+    assert diffuser.muted is True
