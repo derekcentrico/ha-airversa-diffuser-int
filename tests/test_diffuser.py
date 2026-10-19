@@ -865,9 +865,11 @@ async def test_mode_read_back_skips_stale_push(
     assert diffuser.snapshot.mode.grade == 3
 
 
-async def test_mode_resent_on_firmware_that_acks(
+async def test_mode_not_resent_without_known_firmware(
     hass: HomeAssistant, fast_timeouts
 ) -> None:
+    """Unknown firmware still gets one write; the read-back decides."""
+
     def device(frame: bytes) -> list[bytes]:
         if frame[0] == p.CMD_TIME:
             return [MODE_PRESET_2]
@@ -877,10 +879,7 @@ async def test_mode_resent_on_firmware_that_acks(
     diffuser._on_notify(None, bytearray(MODE_PRESET_2))
     with pytest.raises(DiffuserError):
         await diffuser.async_set_mode(p.Mode.CUSTOM)
-    assert (
-        sum(w[0] == p.CMD_MODE for w in client.writes)
-        == diffuser_mod.COMMAND_ATTEMPTS
-    )
+    assert sum(w[0] == p.CMD_MODE for w in client.writes) == 1
 
 
 async def test_concurrent_mode_changes_are_serialised(
@@ -915,3 +914,15 @@ async def test_power_after_queued_dump_uses_request(
     await task
     assert diffuser.is_on is True
     assert diffuser.muted is True
+
+
+async def test_on_after_off_uses_ack_not_stale_report(
+    hass: HomeAssistant,
+) -> None:
+    """A dump that said ON before an OFF must not stand in for the next ON."""
+    diffuser, _ = make(hass, single_byte_acks)
+    diffuser._on_notify(None, bytearray.fromhex("4d53"))
+    await diffuser.async_turn_off()
+    assert diffuser.is_on is False
+    await diffuser.async_turn_on()
+    assert diffuser.is_on is True

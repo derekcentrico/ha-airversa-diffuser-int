@@ -43,7 +43,6 @@ from .const import (
     PIN_REJECTED_DELAY,
     QUEUE_TTL,
     RECONNECT_DELAY,
-    SILENT_MODE_FIRMWARE,
     SYNC_TIMEOUT,
 )
 
@@ -135,6 +134,7 @@ class AirversaDiffuser:
         # Set once the device has pushed 0x4d; a later sync timeout is then
         # not a reason to fall back to re-applying the last request.
         self._reports_power = False
+        self._control_seq = 0
         self.last_error: str | None = None
 
         self._listeners: set[CALLBACK_TYPE] = set()
@@ -306,6 +306,10 @@ class AirversaDiffuser:
 
     async def _async_send_power(self, on: bool, muted: bool) -> None:
         frame = p.build_power(on, muted)
+        # Only a 0x4d that arrives during this call can speak for it; the
+        # snapshot otherwise still holds whatever the last dump reported,
+        # which predates any command-only changes since.
+        control_seq = self._control_seq
 
         def applied(_push: bytes) -> bool:
             control = self.snapshot.control
@@ -325,7 +329,9 @@ class AirversaDiffuser:
                 f"no acknowledgement for {'ON' if on else 'OFF'}; "
                 "state left unchanged"
             )
-        if ack[0] == p.PUSH_CONTROL or applied(ack):
+        if ack[0] == p.PUSH_CONTROL or (
+            self._control_seq != control_seq and applied(ack)
+        ):
             # The device itself reported the requested state.
             return
         # The device handles frames in order, so a 0x4d that arrived before
@@ -398,14 +404,14 @@ class AirversaDiffuser:
                 and (state.mode != p.Mode.PRESET or state.grade == grade)
             )
 
-        # Firmware 11.1.2 neither acks 0x3b nor pushes 0x5b afterwards, so
-        # resending only delays the read-back below.
-        silent = self.advertised_firmware == SILENT_MODE_FIRMWARE
+        # Firmware 11.1.2 neither acks 0x3b nor pushes 0x5b afterwards, and
+        # the advertised firmware is not always known. One write plus the
+        # read-back below confirms either way; resending only adds delay.
         ack = await self._async_command(
             frame,
             confirm_pushes=frozenset({p.PUSH_MODE}),
             matches=lambda _push: applied(),
-            attempts=1 if silent else None,
+            attempts=1,
         )
         if ack is None:
             ack = await self._async_read_back_mode(applied)
@@ -631,6 +637,7 @@ class AirversaDiffuser:
         if handled == p.PUSH_CONTROL and self.snapshot.control is not None:
             control = self.snapshot.control
             self._reports_power = True
+            self._control_seq += 1
             self._power = control.power
             self._power_source = SOURCE_DEVICE
             self._muted = control.muted
