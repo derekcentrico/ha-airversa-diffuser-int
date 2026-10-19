@@ -653,3 +653,26 @@ async def test_reconnect_clears_session_snapshot(
         await diffuser._async_connect_and_maintain(object())
     assert diffuser.snapshot.login is None
     assert diffuser.snapshot.mode is None
+
+
+async def test_unsolicited_legacy_ack_ignored(hass: HomeAssistant) -> None:
+    diffuser, _ = make(hass, silent)
+    diffuser._on_notify(None, bytearray.fromhex("ad13"))
+    assert diffuser.is_on is None
+
+
+async def test_failed_command_not_reapplied(
+    hass: HomeAssistant, fast_timeouts
+) -> None:
+    diffuser, _ = make(hass, silent, model=None)
+    with pytest.raises(DiffuserError):
+        await diffuser.async_turn_on()
+    assert diffuser._desired is None
+
+
+async def test_direct_command_clears_queue(hass: HomeAssistant) -> None:
+    diffuser, _ = make(hass, single_byte_acks)
+    diffuser._queued_power = True
+    await diffuser.async_turn_off()
+    assert diffuser._queued_power is None
+    assert diffuser._desired is False

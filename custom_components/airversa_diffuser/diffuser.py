@@ -48,10 +48,6 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# Legacy two-byte acknowledgements (ACK head plus an echo of the value).
-_LEGACY_ACK_ON = bytes.fromhex("ad13")
-_LEGACY_ACK_OFF = bytes.fromhex("ad12")
-
 SOURCE_DEVICE = "device"
 SOURCE_COMMAND = "command"
 # Device-reported state from an earlier session, not yet refreshed.
@@ -267,8 +263,8 @@ class AirversaDiffuser:
         await self._async_set_power(False)
 
     async def _async_set_power(self, on: bool) -> None:
-        self._desired = on
         if not self._link_ready():
+            self._desired = on
             self._queued_power = on
             self._queued_at = time.monotonic()
             _LOGGER.debug(
@@ -277,8 +273,11 @@ class AirversaDiffuser:
                 "ON" if on else "OFF",
             )
             return
+        # A direct command supersedes anything queued while offline.
+        self._queued_power = None
         async with self._power_lock:
             await self._async_send_power(on, self._mute_for_write())
+        self._desired = on
 
     async def async_set_sound(self, enabled: bool) -> None:
         """Enable or disable the feedback beep.
@@ -504,15 +503,8 @@ class AirversaDiffuser:
             if not pending.future.done():
                 pending.future.set_result(payload)
             return
-        if (
-            payload in (_LEGACY_ACK_ON, _LEGACY_ACK_OFF)
-            and self._power_source != SOURCE_DEVICE
-        ):
-            # Unsolicited legacy echo, e.g. a late ACK after a retry.
-            self._power = payload == _LEGACY_ACK_ON
-            self._power_source = SOURCE_COMMAND
-            self._notify_listeners()
-            return
+        # Unsolicited ACKs, legacy echoes included, carry no trustworthy
+        # state without a request to pair them with.
         _LOGGER.debug("%s: unmatched ACK %s", self.address, payload.hex())
 
     @callback
@@ -594,6 +586,10 @@ class AirversaDiffuser:
         _LOGGER.debug("%s: link dropped", self.address)
         self._connected = False
         self._fail_pending("disconnected")
+        login = self._login_future
+        if login is not None and not login.done():
+            login.set_exception(DiffuserError("disconnected during login"))
+            login.exception()
         self._notify_listeners()
 
     # ------------------------------------------------------------- main loop
